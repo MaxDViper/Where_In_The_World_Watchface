@@ -1,0 +1,54 @@
+{
+    "author": "MaxDViper",
+    "dependencies": {},
+    "keywords": [],
+    "name": "where-in-world",
+    "pebble": {
+        "capabilities": [
+            "location"
+        ],
+        "displayName": "Where In The World Pix Style",
+        "enableMultiJS": false,
+        "messageKeys": {
+            "dummy_time_key": 0,
+            "lat_key": 1,
+            "lon_key": 2
+        },
+        "projectType": "native",
+        "resources": {
+            "media": [
+                {
+                    "file": "images/menu_icon.png",
+                    "menuIcon": true,
+                    "name": "IMAGE_MENU_ICON",
+                    "type": "png"
+                },
+                {
+                    "file": "images/world.png",
+                    "name": "WORLD",
+                    "targetPlatforms": [
+                        "aplite",
+                        "basalt",
+                        "diorite",
+                        "emery",
+                        "flint"
+                    ],
+                    "type": "png"
+                }
+            ]
+        },
+        "sdkVersion": "3",
+        "targetPlatforms": [
+            "aplite",
+            "basalt",
+            "diorite",
+            "emery",
+            "flint"
+        ],
+        "uuid": "7179a7ae-9d2f-4cb4-aee5-ef97f7084468",
+        "watchapp": {
+            "watchface": true
+        }
+    },
+    "version": "2.0.0"
+}
