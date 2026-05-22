@@ -1,16 +1,17 @@
 #include <pebble.h>
 #include "config.h"
 
-#define STR_SIZE 20
-#define REDRAW_INTERVAL 30
-#define TIME_OFFSET_PERSIST 1
-#define LAT_PERSIST 2
-#define LON_PERSIST 3
+// --- CONFIGURATION & MACROS ---
+#define REDRAW_INTERVAL 30     // Redraw the map shadow every 30 minutes
+#define TIME_OFFSET_PERSIST 1  // Storage key for phone time offset
+#define LAT_PERSIST 2          // Storage key for saved Latitude
+#define LON_PERSIST 3          // Storage key for saved Longitude
 
+// Define screen dimensions, fonts, and layout sizes dynamically based on the watch hardware
 #if PBL_DISPLAY_WIDTH > 144
+  // Settings for wider screens (like Pebble Time 2)
   #define WIDTH 200
   #define HEIGHT 139
-  #define MAP_RESOURCE RESOURCE_ID_THREE_WORLDS_200
   #define TIME_FONT FONT_KEY_LECO_60_NUMBERS_AM_PM
   #define DATE_FONT FONT_KEY_GOTHIC_28_BOLD
   #define TEXT_OFFSET 10
@@ -19,9 +20,9 @@
   #define CROSS_WIDTH 2
   #define ODOT_WIDTH 2
 #else
+  // Settings for standard 144px screens (like Pebble Time, Steel, Classic)
   #define WIDTH 144
   #define HEIGHT 100
-  #define MAP_RESOURCE RESOURCE_ID_THREE_WORLDS_144
   #define TIME_FONT FONT_KEY_LECO_42_NUMBERS
   #define DATE_FONT FONT_KEY_GOTHIC_18_BOLD
   #define TEXT_OFFSET 3
@@ -31,9 +32,13 @@
   #define ODOT_WIDTH 1
 #endif
 
+// --- GLOBAL VARIABLES ---
+// Coordinates mapped to pixel locations on the map (-1 means no GPS data yet)
 int LOCAL_X = -1;
 int LOCAL_Y = -1;
+int time_offset = 0; // Difference between watch time and UTC time from phone
 
+// UI Elements
 static Window *window;
 static TextLayer *time_text_layer;
 static TextLayer *date_text_layer;
@@ -41,109 +46,97 @@ static TextLayer *bottom_text_layer;
 static GBitmap *world_bitmap;
 static Layer *canvas;
 static GBitmap *image;
-static int redraw_counter;
-// s is set to memory of size STR_SIZE, and temporarily stores strings
-char *s;
 
-int time_offset = 0;
+// --- UI THEME CHANGER ---
+static void flip_color(int sw) {
+  // sw = 0 means day (White Background). Otherwise night (Black Background).
+  GColor bg_color = (sw == 0) ? GColorWhite : GColorBlack;
+  GColor fg_color = (sw == 0) ? GColorBlack : GColorWhite;
 
-static void flip_color(int sw){
-  // swith=0 means day, other means night
-  if(sw == 0){
-    text_layer_set_background_color(time_text_layer, GColorWhite);
-    text_layer_set_text_color(time_text_layer, GColorBlack);
-    text_layer_set_background_color(date_text_layer, GColorWhite);
-    text_layer_set_text_color(date_text_layer, GColorBlack);
-    text_layer_set_background_color(bottom_text_layer, GColorWhite);
-    text_layer_set_text_color(bottom_text_layer, GColorBlack);
-  } else {
-    text_layer_set_background_color(time_text_layer, GColorBlack);
-    text_layer_set_text_color(time_text_layer, GColorWhite);
-    text_layer_set_background_color(date_text_layer, GColorBlack);
-    text_layer_set_text_color(date_text_layer, GColorWhite);
-    text_layer_set_background_color(bottom_text_layer, GColorBlack);
-    text_layer_set_text_color(bottom_text_layer, GColorWhite);
-  }
+  // Apply the chosen theme to all text layers
+  text_layer_set_background_color(time_text_layer, bg_color);
+  text_layer_set_text_color(time_text_layer, fg_color);
+  text_layer_set_background_color(date_text_layer, bg_color);
+  text_layer_set_text_color(date_text_layer, fg_color);
+  text_layer_set_background_color(bottom_text_layer, bg_color);
+  text_layer_set_text_color(bottom_text_layer, fg_color);
 }
 
+// --- MAP & SHADOW GENERATION ---
 static void draw_earth() {
-  // ##### calculate the time
+  // 1. Calculate the current time and date progress
   int now = (int)time(NULL) + time_offset;
-  float day_of_year; // value from 0 to 1 of progress through a year
-  float time_of_day; // value from 0 to 1 of progress through a day
-  // approx number of leap years since epoch
-  // = now / SECONDS_IN_YEAR * .24; (.24 = average rate of leap years)
+  float day_of_year; 
+  float time_of_day; 
   int leap_years = (int)((float)now / 131487192.0);
-  // day_of_year is an estimate, but should be correct to within one day
+  
   day_of_year = now - (((int)((float)now / 31556926.0) * 365 + leap_years) * 86400);
   day_of_year = day_of_year / 86400.0;
   time_of_day = day_of_year - (int)day_of_year;
   day_of_year = day_of_year / 365.0;
-  // ##### calculate the position of the sun
-  // left to right of world goes from 0 to 65536
+  
+  // 2. Calculate where the sun is currently shining
   int sun_x = (int)((float)TRIG_MAX_ANGLE * (1.0 - time_of_day));
-  // bottom to top of world goes from -32768 to 32768
-  // 0.2164 is march 20, the 79th day of the year, the march equinox
-  // Earth's inclination is 23.4 degrees, so sun should vary 23.4/90=.26 up and down
   int sun_y = -sin_lookup((day_of_year - 0.2164) * TRIG_MAX_ANGLE) * .26 * .25;
-  // ##### draw the bitmap
+  
+  // 3. Scan through every single pixel on the map canvas
   int x, y;
   for(x = 0; x < WIDTH; x++) {
     int x_angle = (int)((float)TRIG_MAX_ANGLE * (float)x / (float)(WIDTH));
     for(y = 0; y < HEIGHT; y++) {
       int y_angle = (int)((float)TRIG_MAX_ANGLE * (float)y / (float)(HEIGHT * 2)) - TRIG_MAX_ANGLE/4;
-      // spherical law of cosines
+      
+      // Calculate the shadow line using the spherical law of cosines
       float angle = ((float)sin_lookup(sun_y)/(float)TRIG_MAX_RATIO) * ((float)sin_lookup(y_angle)/(float)TRIG_MAX_RATIO);
       angle = angle + ((float)cos_lookup(sun_y)/(float)TRIG_MAX_RATIO) * ((float)cos_lookup(y_angle)/(float)TRIG_MAX_RATIO) * ((float)cos_lookup(sun_x - x_angle)/(float)TRIG_MAX_RATIO);
+      
 #ifdef PBL_BW
+      // Apply 1-bit Black and White pixel logic (reads bits left-to-right)
       int byte = y * gbitmap_get_bytes_per_row(world_bitmap) + (int)(x / 8);
       if ((angle < 0) ^ (0x1 & (((char *)gbitmap_get_data(world_bitmap))[byte] >> (7 - x % 8)))) {
-        // white pixel
         ((char *)gbitmap_get_data(image))[byte] = ((char *)gbitmap_get_data(image))[byte] | (0x1 << (7 - x % 8));
       } else {
-        // black pixel
         ((char *)gbitmap_get_data(image))[byte] = ((char *)gbitmap_get_data(image))[byte] & ~(0x1 << (7 - x % 8));
       }
 #else
+      // Apply Color logic (grabs the shadow pixel from the bottom half of the source image)
       int byte = y * gbitmap_get_bytes_per_row(world_bitmap) + (int)(x / 2);
-      if (angle < 0) { // dark pixel
+      if (angle < 0) { 
         ((char *)gbitmap_get_data(world_bitmap))[byte] = ((char *)gbitmap_get_data(world_bitmap))[(int)(WIDTH*HEIGHT / 2) + byte];
-      } else { // light pixel
+      } else { 
         ((char *)gbitmap_get_data(world_bitmap))[byte] = ((char *)gbitmap_get_data(world_bitmap))[WIDTH*HEIGHT + byte];
       }
 #endif
-      // Day/Night UI Check
+      
+      // 4. If we are currently evaluating the pixel where the user is standing, update the theme
       if(x == LOCAL_X && y == LOCAL_Y){
-        if (angle < 0) {
-          flip_color(1); // Night time
-        } else {
-          flip_color(0); // Day time
-        }
+        flip_color(angle < 0 ? 1 : 0); // 1 = Night, 0 = Day
       }
     }
   }
+  // Tell the watch to push the updated map to the screen
   layer_mark_dirty(canvas);
 }
 
+// --- CANVAS RENDERING ---
 static void draw_watch(struct Layer *layer, GContext *ctx) {
-  // Get the dynamic bounds of our canvas layer
+  // Center the map dynamically in case the screen is wider than the map image
   GRect bounds = layer_get_unobstructed_bounds(layer);
-  
-  // Calculate dynamic offsets to center the 144x100 map horizontally
   int map_offset_x = (bounds.size.w - WIDTH) / 2;
-  int map_offset_y = 0; // Keeping it at the top
+  int map_offset_y = 0; 
   
-  // 1. Draw the earth bitmap at the centered offset
+  // Draw the actual generated map
   graphics_draw_bitmap_in_rect(ctx, image, GRect(map_offset_x, map_offset_y, WIDTH, HEIGHT));
   
-  // Only draw the crosshair if we have a valid location
+  // Only draw the crosshair if we have successfully received GPS coordinates
   if (LOCAL_X >= 0 && LOCAL_Y >= 0) {
-    // Shift the actual location by the dynamic map offset
+    // Shift the crosshair to match the map's centered offset
     int cross_x = LOCAL_X + map_offset_x;
     int cross_y = LOCAL_Y + map_offset_y;
     int gap = ODOT_SIZE;
 
     #if defined(PBL_COLOR)
+      // Standard color crosshair
       graphics_context_set_stroke_width(ctx, CROSS_WIDTH);
       graphics_context_set_stroke_color(ctx, GColorLightGray);
       
@@ -157,7 +150,8 @@ static void draw_watch(struct Layer *layer, GContext *ctx) {
       graphics_context_set_fill_color(ctx, GColorRed);
       graphics_fill_circle(ctx, GPoint(cross_x, cross_y), IDOT_SIZE);
     #else 
-      // Step A: Draw the White Line (3 pixels wide)
+      // High-contrast "Halo" crosshair for Black & White screens
+      // Step A: Draw a thick white line as the background outline
       graphics_context_set_stroke_color(ctx, GColorWhite);
       graphics_context_set_stroke_width(ctx, 3);
       
@@ -166,11 +160,10 @@ static void draw_watch(struct Layer *layer, GContext *ctx) {
       graphics_draw_line(ctx, GPoint(cross_x, map_offset_y), GPoint(cross_x, cross_y - gap));
       graphics_draw_line(ctx, GPoint(cross_x, cross_y + gap), GPoint(cross_x, map_offset_y + HEIGHT));
       
-      // Draw a solid white background for the target circle
       graphics_context_set_fill_color(ctx, GColorWhite);
       graphics_fill_circle(ctx, GPoint(cross_x, cross_y), 4); 
 
-      // Step B: Draw the Black Line (1 pixel wide) right down the middle
+      // Step B: Draw a thin black line right down the middle
       graphics_context_set_stroke_color(ctx, GColorBlack);
       graphics_context_set_stroke_width(ctx, 1);
       
@@ -179,7 +172,6 @@ static void draw_watch(struct Layer *layer, GContext *ctx) {
       graphics_draw_line(ctx, GPoint(cross_x, map_offset_y), GPoint(cross_x, cross_y - gap));
       graphics_draw_line(ctx, GPoint(cross_x, cross_y + gap), GPoint(cross_x, map_offset_y + HEIGHT));
 
-      // Draw the delicate black target ring and center dot
       graphics_context_set_fill_color(ctx, GColorBlack);
       graphics_draw_circle(ctx, GPoint(cross_x, cross_y), 3);
       graphics_fill_circle(ctx, GPoint(cross_x, cross_y), 1);
@@ -187,26 +179,28 @@ static void draw_watch(struct Layer *layer, GContext *ctx) {
   }
 }
 
+// --- TICK HANDLER (Fires every minute) ---
 static void handle_minute_tick(struct tm *tick_time, TimeUnits units_changed) {
   static char time_text[] = "00:00";
   static char date_text[] = "00 Mth | 00 Day";
 
+  // Format and update Date
   strftime(date_text, sizeof(date_text), "%m %b | %d %a", tick_time);
   text_layer_set_text(date_text_layer, date_text);
 
+  // Format and update Time
   strftime(time_text, sizeof(time_text), "%I:%M", tick_time);
   text_layer_set_text(time_text_layer, time_text);
   
-  // Redraw the earth at defined interval
+  // Only trigger the heavy map calculation if we've hit our redraw interval
   if (tick_time->tm_min % REDRAW_INTERVAL == 0) {
     draw_earth();
   }
 }
 
-// Get the time from the phone, which is probably UTC
-// Calculate and store the offset when compared to the local clock
+// --- PHONE COMMUNICATION ---
 static void app_message_inbox_received(DictionaryIterator *iterator, void *context) {
-  // 1. Time Sync Logic
+  // 1. Sync Time Offset from Phone (UTC)
   Tuple *t = dict_find(iterator, 0);
   if (t) {
     int unixtime = t->value->int32;
@@ -215,7 +209,7 @@ static void app_message_inbox_received(DictionaryIterator *iterator, void *conte
     persist_write_int(TIME_OFFSET_PERSIST, time_offset); 
   }
 
-  // 2. Location Logic
+  // 2. Receive GPS Location from Phone
   Tuple *lat_tuple = dict_find(iterator, 1);
   Tuple *lon_tuple = dict_find(iterator, 2);
   
@@ -223,26 +217,28 @@ static void app_message_inbox_received(DictionaryIterator *iterator, void *conte
     int32_t lat_val = lat_tuple->value->int32;
     int32_t lon_val = lon_tuple->value->int32;
 
-    // Save to persistent storage so it's there next time we start
+    // Save to persistent memory so it survives watch reboots
     persist_write_int(LAT_PERSIST, lat_val);
     persist_write_int(LON_PERSIST, lon_val);
 
-    // We divide by 10000 because JS sends floats as scaled integers 
+    // Reconstruct the floating point numbers (JS sends them as scaled integers)
     float lat = (float)lat_tuple->value->int32 / 10000.0;
     float lon = (float)lon_tuple->value->int32 / 10000.0;
 
-    // Convert real-world coordinates to map pixels
+    // Translate global Latitude/Longitude to local X/Y screen pixels
     LOCAL_X = (int)(((lon + 180.0) / 360.0) * WIDTH);
     LOCAL_Y = (int)(((90.0 - lat) / 180.0) * HEIGHT);
     
     APP_LOG(APP_LOG_LEVEL_DEBUG, "New Location Received: X:%d, Y:%d", LOCAL_X, LOCAL_Y);
   }
 
-  // Redraw the map with the new data
+  // Force map to update immediately with the new data
   draw_earth();
 }
 
+// --- WINDOW BUILDER ---
 static void window_load(Window *window) {
+  // Define default boot colors
 #ifdef BLACK_ON_WHITE
   GColor background_color = GColorBlack;
   GColor foreground_color = GColorWhite;
@@ -252,16 +248,18 @@ static void window_load(Window *window) {
 #endif
   window_set_background_color(window, background_color);
   
-  // Get the dynamic bounds of the watch face
   Layer *window_layer = window_get_root_layer(window);
   GRect bounds = layer_get_unobstructed_bounds(window_layer);
 
+  // Calculate the remaining screen space below the map
   int text_area_start = HEIGHT - TEXT_OFFSET;
   int remaining_height = bounds.size.h - text_area_start;
   
+  // Divide remaining space: 60% for time, 40% for date
   int time_height = (remaining_height * 60) / 100;
   int date_height = remaining_height - time_height;
 
+  // Build Time Text
   time_text_layer = text_layer_create(GRect(0, text_area_start, bounds.size.w, time_height));
   text_layer_set_background_color(time_text_layer, background_color);
   text_layer_set_text_color(time_text_layer, foreground_color);
@@ -270,12 +268,13 @@ static void window_load(Window *window) {
   text_layer_set_text_alignment(time_text_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(time_text_layer));
 
-  // The bottom text layer acts as a background block for the date
+  // Build Bottom Block (Acts as a solid background block behind the date)
   bottom_text_layer = text_layer_create(GRect(0, text_area_start + time_height, bounds.size.w, date_height));
   text_layer_set_background_color(bottom_text_layer, background_color);
   text_layer_set_text_color(bottom_text_layer, foreground_color);
   layer_add_child(window_layer, text_layer_get_layer(bottom_text_layer));
 
+  // Build Date Text
   date_text_layer = text_layer_create(GRect(0, text_area_start + time_height, bounds.size.w, date_height));
   text_layer_set_background_color(date_text_layer, background_color);
   text_layer_set_text_color(date_text_layer, foreground_color);
@@ -284,19 +283,24 @@ static void window_load(Window *window) {
   text_layer_set_text_alignment(date_text_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(date_text_layer));
 
-  // Canvas covers the whole screen to allow flexible drawing
+  // Build Canvas (Sits over the whole screen, update_proc handles the actual drawing)
   canvas = layer_create(bounds);
   layer_set_update_proc(canvas, draw_watch);
   layer_add_child(window_layer, canvas);
+
+  // Initialize the image memory correctly based on platform
 #ifdef PBL_BW
   image = gbitmap_create_with_resource(RESOURCE_ID_WORLD);
 #else
   image = gbitmap_create_as_sub_bitmap(world_bitmap, GRect(0, 0, WIDTH, HEIGHT));
 #endif
+
+  // Do the first map generation so it isn't blank on boot
   draw_earth();
 }
 
 static void window_unload(Window *window) {
+  // Free all UI elements from memory
   text_layer_destroy(time_text_layer);
   text_layer_destroy(date_text_layer);
   text_layer_destroy(bottom_text_layer);
@@ -304,17 +308,15 @@ static void window_unload(Window *window) {
   gbitmap_destroy(image);
 }
 
+// --- APP LIFECYCLE ---
 static void init(void) {
-  redraw_counter = 0;
-
-  // Load the UTC offset, if it exists
-  time_offset = 0;
+  // 1. Recover saved time offset from storage
   if (persist_exists(TIME_OFFSET_PERSIST)) {
     time_offset = persist_read_int(TIME_OFFSET_PERSIST);
     APP_LOG(APP_LOG_LEVEL_DEBUG, "loaded offset %d", time_offset);
   }
   
-  // Load the Last Known Location
+  // 2. Recover saved location from storage (so crosshair shows instantly)
   if (persist_exists(LAT_PERSIST) && persist_exists(LON_PERSIST)) {
     int32_t lat_val = persist_read_int(LAT_PERSIST);
     int32_t lon_val = persist_read_int(LON_PERSIST);
@@ -328,39 +330,40 @@ static void init(void) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "Loaded saved location: X:%d, Y:%d", LOCAL_X, LOCAL_Y);
   }
   
+  // Load the core map resource
   world_bitmap = gbitmap_create_with_resource(RESOURCE_ID_WORLD);
+  
+  // Setup Window Handlers
   window = window_create();
   window_set_window_handlers(window, (WindowHandlers) {
     .load = window_load,
     .unload = window_unload,
   });
-  
-  const bool animated = true;
-  window_stack_push(window, animated);
+  window_stack_push(window, true);
 
-  s = malloc(STR_SIZE);
+  // Start the minute ticker
   tick_timer_service_subscribe(MINUTE_UNIT, handle_minute_tick);
   
+  // Force a manual tick right away to populate the time/date
   time_t temp = time(NULL);
   struct tm *tick_time = localtime(&temp);
   handle_minute_tick(tick_time, MINUTE_UNIT);
 
+  // Setup JS communication
   app_message_register_inbox_received(app_message_inbox_received);
   app_message_open(128, 128);
 }
 
 static void deinit(void) {
+  // Clean up services and window
   tick_timer_service_unsubscribe();
-  free(s);
   window_destroy(window);
   gbitmap_destroy(world_bitmap);
 }
 
 int main(void) {
   init();
-
   APP_LOG(APP_LOG_LEVEL_DEBUG, "Done initializing, pushed window: %p", window);
-
   app_event_loop();
   deinit();
 }
